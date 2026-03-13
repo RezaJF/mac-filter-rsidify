@@ -24,7 +24,7 @@ workflow mac_filter_rsidify {
 
     Int     mac_threshold  = 30
     Float   maf_threshold  = 0.0001
-    Int     batch_size     = 5
+    Int     batch_size     = 10
 
     String  docker
 
@@ -360,8 +360,8 @@ task rsidify_and_filter_batch {
 
   runtime {
     docker: docker
-    cpu: 2
-    memory: "8 GB"
+    cpu: 4
+    memory: "16 GB"
     disks: "local-disk " + disk_size + " SSD"
     zones: "europe-west1-b europe-west1-c europe-west1-d"
     preemptible: 2

@@ -14,7 +14,7 @@ For every input summary-statistics `.gz` file the pipeline runs three stages:
 | **2. MAC/MAF filter** | Computes `MAF = min(af, 1-af)` and `MAC = MAF × sample_size`; rejects variants below the configurable thresholds | `*_intermediary.gz` — all original columns + rsid, filtered |
 | **3. LDSC premunge** | Extracts `SNP, A1, A2, BETA, P`; explodes comma-separated rsIDs into separate rows | `*_premunged.gz` — 5-column LDSC format |
 
-Processing is **batched**: `batch_size` files (default 5) share a single VM so
+Processing is **batched**: `batch_size` files (default 10) share a single VM so
 the large dbSNP database is downloaded only once per batch rather than once per
 file.
 
@@ -117,7 +117,7 @@ cromshell submit wdl/mac_filter_rsidify.wdl inputs.json
 |-------|------|---------|-------------|
 | `mac_threshold` | `Int` | `30` | Minimum Minor Allele Count |
 | `maf_threshold` | `Float` | `0.0001` | Minimum Minor Allele Frequency |
-| `batch_size` | `Int` | `5` | Files processed per VM |
+| `batch_size` | `Int` | `10` | Files processed per VM |
 | `chrom_col` | `String` | `#chrom` | Chromosome column name in input |
 | `pos_col` | `String` | `pos` | Position column name |
 | `ref_col` | `String` | `ref` | Reference allele column name |
@@ -145,15 +145,15 @@ cromshell submit wdl/mac_filter_rsidify.wdl inputs.json
                                 │
                      ┌──────────▼──────────┐
                      │   create_batches     │
-                     │  (split into N/5     │
+                     │  (split into N/10    │
                      │   batch manifests)   │
                      └──────────┬──────────┘
                                 │
               ┌─────────────────┼─────────────────┐
               │                 │                  │
      ┌────────▼────────┐ ┌─────▼──────┐  ┌───────▼───────┐
-     │ batch_0 (5 files)│ │ batch_1    │  │ batch_N/5     │
-     │                  │ │ (5 files)  │  │ (≤5 files)    │
+     │ batch_0 (10 files│ │ batch_1    │  │ batch_N/10    │
+     │                  │ │ (10 files) │  │ (≤10 files)   │
      │ 1. rsIDify       │ │            │  │               │
      │ 2. MAC/MAF filter│ │   ...      │  │    ...        │
      │ 3. LDSC premunge │ │            │  │               │
@@ -171,22 +171,22 @@ cromshell submit wdl/mac_filter_rsidify.wdl inputs.json
 Each scattered batch VM:
 1. **Localises** the ~98 GB dbSNP database once (Cromwell handles this;
    ~3–5 min within europe-west1 at 3–5 Gbps intra-region bandwidth)
-2. **Processes** each of its 5 files sequentially (rsIDify → filter → premunge)
+2. **Processes** each of its 10 files sequentially (rsIDify → filter → premunge)
 3. **Cleans up** temp files after each file to minimise disk usage
 
 ### Why batching?
 
 With hundreds of input files, a naive one-file-per-VM scatter would create
 hundreds of VMs each downloading the 98 GB database.  Batching into groups of
-5 reduces the number of database downloads by 5×, saving ~3–5 min of startup
+10 reduces the number of database downloads by 10×, saving ~3–5 min of startup
 overhead per eliminated VM while keeping parallelism high.
 
 ### Runtime characteristics per batch VM
 
 | Resource | Value | Rationale |
 |----------|-------|-----------|
-| CPU | 2 | rsIDify is single-threaded; second core for OS / I/O |
-| Memory | 8 GB | SQLite page-cache warm-up benefits from available RAM |
+| CPU | 4 | rsIDify is single-threaded; extra cores for parallel I/O compression |
+| Memory | 16 GB | SQLite page-cache warm-up benefits from available RAM; handles larger batches |
 | Disk | ~128 GB SSD | 98 GB DB + 30 GB working space; SSD for random-access I/O |
 | Preemptible | 2 retries | Cost-effective; Cromwell retries on preemption |
 
