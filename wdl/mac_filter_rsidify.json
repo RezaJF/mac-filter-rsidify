@@ -1,0 +1,18 @@
+{
+    "mac_filter_rsidify.sumstats_manifest": "gs://your-bucket/path/to/manifest.tsv",
+    "mac_filter_rsidify.dbsnp_database":    "gs://r13-data/reza/dbsnp_b155/dbsnp_b155_hg38.db",
+
+    "mac_filter_rsidify.mac_threshold": 30,
+    "mac_filter_rsidify.maf_threshold": 0.0001,
+    "mac_filter_rsidify.batch_size":    5,
+
+    "mac_filter_rsidify.docker": "europe-west1-docker.pkg.dev/finngen-refinery-dev/fg-refinery-registry/mac-filter-rsidify:v1",
+
+    "mac_filter_rsidify.chrom_col": "#chrom",
+    "mac_filter_rsidify.pos_col":   "pos",
+    "mac_filter_rsidify.ref_col":   "ref",
+    "mac_filter_rsidify.alt_col":   "alt",
+    "mac_filter_rsidify.af_col":    "af_alt",
+    "mac_filter_rsidify.beta_col":  "beta",
+    "mac_filter_rsidify.pval_col":  "pval"
+}

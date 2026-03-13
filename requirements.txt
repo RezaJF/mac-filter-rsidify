@@ -1,0 +1,2 @@
+# No external Python packages are required.
+# rsidify_sqlite.py uses only the standard library (sqlite3, gzip, argparse).
