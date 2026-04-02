@@ -47,59 +47,81 @@ mac-filter-rsidify/
 
 ## Quickstart
 
-### 1. Generate the manifest
+### 1. Generate the manifest, upload it, and create the inputs JSON
 
-The pipeline expects a **headerless, tab-delimited** manifest with four
-columns:
+`scripts/generate_manifest.py` does all three steps in one command:
+
+1. Discovers `.gz` sumstats in `--sumstats-dir`
+2. Writes a manifest TSV locally at `--output`
+3. Uploads the TSV to `<sumstats-dir>/<tsv-basename>` on GCS
+4. Writes a Cromwell inputs JSON beside the TSV (same stem, `.json` extension),
+   with `sumstats_manifest` pointing at the uploaded GCS path
+
+The pipeline expects a **headerless, tab-delimited** manifest with four columns:
 
 ```
 trait_name    analysis_type    gs://path/to/sumstats.gz    sample_size
 ```
 
-Use the helper script:
-
 ```bash
-# Uniform sample size
+# Uniform sample size — all defaults (MAC 30, MAF 0.0001, batch_size 10)
 python3 scripts/generate_manifest.py \
-    --sumstats-dir gs://bucket/path/to/sumstats \
+    --sumstats-dir gs://r13-data/fg3_aggregate_pQTLs/05.chunk_2001_2500/ \
     --sample-size 4144 \
     --analysis-type pqtl \
-    --output manifest.tsv
+    --output wdl/05.chunk_2001_2500.tsv
 
-# Per-trait sample sizes
+# Per-trait sample sizes from a mapping file
 python3 scripts/generate_manifest.py \
     --sumstats-dir gs://bucket/path/to/sumstats \
     --sample-size-map sample_sizes.tsv \
     --analysis-type pqtl \
-    --output manifest.tsv
+    --output wdl/05.chunk_2001_2500.tsv
 ```
 
-Upload the manifest to GCS:
+The mapping file (`--sample-size-map`) is a headerless TSV with columns
+`trait_name` and `sample_size`.
+
+**All WDL pipeline parameters are configurable** and default to the FinnGen
+production values:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--dbsnp-database` | `gs://r13-data/reza/dbsnp_b155/dbsnp_b155_hg38.db` | dbSNP SQLite DB |
+| `--docker` | `…/mac-filter-rsidify:v1` | Docker image URI |
+| `--mac-threshold` | `30` | Minimum Minor Allele Count |
+| `--maf-threshold` | `0.0001` | Minimum Minor Allele Frequency |
+| `--batch-size` | `10` | Files processed per VM |
+| `--chrom-col` | `#chrom` | Chromosome column name |
+| `--pos-col` | `pos` | Position column name |
+| `--ref-col` | `ref` | Reference allele column name |
+| `--alt-col` | `alt` | Alternative allele column name |
+| `--af-col` | `af_alt` | Allele frequency column name |
+| `--beta-col` | `beta` | Effect size column name |
+| `--pval-col` | `pval` | P-value column name |
+
+Use `--no-upload` or `--no-json` to suppress the corresponding side-effect
+(e.g. for dry-runs or regenerating one artefact independently).
+
+### 2. Submit to Refinery via `cromwell_interact.py`
+
+After step 1, submit the generated JSON directly:
 
 ```bash
-gsutil cp manifest.tsv gs://your-bucket/path/to/manifest.tsv
+cromwell submit \
+    --wdl wdl/mac_filter_rsidify.wdl \
+    --inputs wdl/05.chunk_2001_2500.json \
+    --l product=core-analysis-r13
+
+# Monitor progress
+cromwell meta <workflow-id> -r          # quick status
+cromwell meta <workflow-id> -s          # full scatter summary
 ```
 
-### 2. Edit the inputs JSON
-
-Copy `wdl/mac_filter_rsidify.json` and set at minimum:
-
-| Key | Description |
-|-----|-------------|
-| `sumstats_manifest` | GCS path to your manifest TSV |
-| `dbsnp_database` | GCS path to the dbSNP SQLite DB |
-| `docker` | Full Docker image URI with tag |
-
-All other parameters have sensible defaults.
-
-### 3. Submit to Refinery
-
-Upload the WDL and inputs JSON to Refinery, or submit via the Cromwell API:
-
-```bash
-# Example using cromshell
-cromshell submit wdl/mac_filter_rsidify.wdl inputs.json
-```
+Where `cromwell` is an alias for
+`/path/to/CromwellInteract/cromwell_interact.py` (see your `~/.bash_profile`).
+An SSH SOCKS tunnel must be open beforehand (`cromwell-fg-refinery2` or
+`cromwell-fg-3` alias).
 
 ## WDL Inputs Reference
 
@@ -134,6 +156,87 @@ cromshell submit wdl/mac_filter_rsidify.wdl inputs.json
 | `intermediary_outputs` | `Array[File]` | Full-column filtered `.gz` files (all columns + rsid) |
 | `per_file_logs` | `Array[File]` | Per-file processing logs with variant counts |
 | `summary_csv` | `File` | Aggregated CSV summary of all processed files |
+
+### Where results are written on GCS (important)
+
+Cromwell does **not** write pipeline outputs back into the same bucket or folder
+as your input summary statistics unless you add a separate copy step.  Inputs
+are **localised** from paths in the manifest (e.g. `gs://r13-data/.../trait.gz`);
+**outputs** are **delocalised** to the Cromwell **execution** bucket for that
+workflow run.
+
+#### Workflow execution root
+
+After submission, each run has a unique id.  Cromwell stores everything under a
+**workflow root** whose exact bucket depends on your Refinery / Cromwell
+backend configuration.  Typical FinnGen patterns include:
+
+| Backend / environment | Example workflow root prefix |
+|-------------------------|------------------------------|
+| Some Refinery deployments | `gs://cromwell-fg-3/mac_filter_rsidify/<workflow-uuid>/` |
+| Others (e.g. Refinery 2) | `gs://fg-cromwell-refinery2/mac_filter_rsidify/<workflow-uuid>/` |
+
+Replace `<workflow-uuid>` with the id returned by Cromwell when you submit (also
+recorded in `CromwellInteract/workflows.log` if you use `cromwell_interact.py`).
+The **authoritative** path for a given run appears in Cromwell metadata as
+`workflowRoot`, or in the UI / `cromwell meta <id> -s` output.
+
+#### Per-batch (`rsidify_and_filter_batch`) outputs
+
+For each scatter shard (one per batch of `batch_size` traits), Cromwell writes
+task outputs under:
+
+```text
+<workflowRoot>/call-rsidify_and_filter_batch/shard-<N>/glob-<hash>/
+```
+
+There are **three** `glob()` outputs from the WDL, so you will normally see **three**
+different `glob-<hash>/` directories per shard (Cromwell hashes may differ per
+output expression).  Files include:
+
+| Pattern | Content |
+|---------|---------|
+| `*_<analysis>_mac<MAC>_maf<MAF>_premunged.gz` | LDSC five-column premunged sumstats |
+| `*_<analysis>_mac<MAC>_maf<MAF>_intermediary.gz` | Full columns + `rsid`, MAC/MAF filtered |
+| `*_<analysis>.log` | Per-trait processing log (variant counts, duration, SUCCESS/FAILED) |
+
+The MAF segment in filenames may appear in scientific notation (e.g.
+`maf1.0E-4`) depending on floating-point formatting.
+
+**Nothing appears under these `glob-*` paths until that shard’s task completes
+successfully.**  While a VM is still running (or retrying after preemption),
+only logs such as `stdout`, `stderr`, and GCP Batch agent logs may be present.
+
+#### `gather_summary` output
+
+After **all** scatter shards of `rsidify_and_filter_batch` finish, Cromwell runs
+`gather_summary`.  The aggregated file is written under:
+
+```text
+<workflowRoot>/call-gather_summary/
+```
+
+(Exact object name is resolved by Cromwell; inspect that call’s outputs in
+metadata or use `cromwell outfiles <id>` — see below.)
+
+#### What stays in your “input” bucket
+
+Paths you put in the manifest (and any manifest TSV you uploaded next to your
+chunk) remain **inputs only**.  Do not expect `*_premunged.gz` or
+`*_intermediary.gz` to appear automatically under
+`gs://r13-data/fg3_aggregate_pQTLs/...` unless you **copy** them there after the
+run.
+
+#### Finding files in practice
+
+```bash
+# List all premunged outputs for one workflow (adjust bucket and uuid)
+gsutil ls -r "gs://cromwell-fg-3/mac_filter_rsidify/<workflow-uuid>/call-rsidify_and_filter_batch/" | grep premunged
+
+# Cromwell metadata: print workflowRoot and output file paths
+# (requires an SSH tunnel and cromwell_interact.py, or the Cromwell REST API)
+python3 /path/to/CromwellInteract/cromwell_interact.py outfiles <workflow-uuid>
+```
 
 ## Architecture
 
