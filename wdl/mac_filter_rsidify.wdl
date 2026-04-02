@@ -9,9 +9,10 @@ version 1.0
 #   2. MAC (Minor Allele Count) and MAF (Minor Allele Frequency) filtering
 #   3. LDSC pre-munging — extract SNP, A1, A2, BETA, P columns
 #
-# Summary statistics are processed in batches of `batch_size` per VM so that
-# the ~98 GB dbSNP database is downloaded only once per batch rather than
-# once per file.
+# Summary statistics are processed in batches of `batch_size` per Cromwell shard
+# (default 1 = one file per shard, maximum parallelism). The ~98 GB dbSNP
+# database is localised once per shard; larger batch_size shares that download
+# across more files per VM.
 #
 # Designed for FinnGen Refinery (Cromwell on GCP).
 # =============================================================================
@@ -24,7 +25,7 @@ workflow mac_filter_rsidify {
 
     Int     mac_threshold  = 30
     Float   maf_threshold  = 0.0001
-    Int     batch_size     = 10
+    Int     batch_size     = 1
 
     String  docker
 

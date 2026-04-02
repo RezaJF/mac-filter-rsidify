@@ -63,7 +63,7 @@ _DEFAULT_DOCKER  = (
 )
 _DEFAULT_MAC     = 30
 _DEFAULT_MAF     = 0.0001
-_DEFAULT_BATCH   = 10
+_DEFAULT_BATCH   = 1
 _DEFAULT_CHROM   = "#chrom"
 _DEFAULT_POS     = "pos"
 _DEFAULT_REF     = "ref"

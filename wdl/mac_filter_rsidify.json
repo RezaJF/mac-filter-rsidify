@@ -4,7 +4,7 @@
 
     "mac_filter_rsidify.mac_threshold": 30,
     "mac_filter_rsidify.maf_threshold": 0.0001,
-    "mac_filter_rsidify.batch_size":    10,
+    "mac_filter_rsidify.batch_size":    1,
 
     "mac_filter_rsidify.docker": "europe-west1-docker.pkg.dev/finngen-refinery-dev/fg-refinery-registry/mac-filter-rsidify:v1",
 

@@ -14,9 +14,10 @@ For every input summary-statistics `.gz` file the pipeline runs three stages:
 | **2. MAC/MAF filter** | Computes `MAF = min(af, 1-af)` and `MAC = MAF × sample_size`; rejects variants below the configurable thresholds | `*_intermediary.gz` — all original columns + rsid, filtered |
 | **3. LDSC premunge** | Extracts `SNP, A1, A2, BETA, P`; explodes comma-separated rsIDs into separate rows | `*_premunged.gz` — 5-column LDSC format |
 
-Processing is **batched**: `batch_size` files (default 10) share a single VM so
-the large dbSNP database is downloaded only once per batch rather than once per
-file.
+Processing is **batched**: up to `batch_size` files share one Cromwell scatter
+shard (one VM). The **default `batch_size` is `1`**, which maximises parallelism
+(one input file per shard). Larger values amortise the ~98 GB dbSNP download
+across more files per VM at the cost of fewer parallel shards.
 
 ## Repository layout
 
@@ -48,8 +49,8 @@ mac-filter-rsidify/
 ## Quickstart
 
 ### 1. Generate the manifest, upload it, and create the inputs JSON
-
-`scripts/generate_manifest.py` does all three steps in one command:
+The pipeline expects a **headerless, tab-delimited** manifest with four
+columns: `scripts/generate_manifest.py` does all three steps in one command:
 
 1. Discovers `.gz` sumstats in `--sumstats-dir`
 2. Writes a manifest TSV locally at `--output`
@@ -64,19 +65,19 @@ trait_name    analysis_type    gs://path/to/sumstats.gz    sample_size
 ```
 
 ```bash
-# Uniform sample size — all defaults (MAC 30, MAF 0.0001, batch_size 10)
+# Uniform sample size — all defaults (MAC 30, MAF 0.0001, batch_size 1)
 python3 scripts/generate_manifest.py \
-    --sumstats-dir gs://r13-data/fg3_aggregate_pQTLs/05.chunk_2001_2500/ \
+    --sumstats-dir gs://bucket/path/to/sumstats \
     --sample-size 4144 \
     --analysis-type pqtl \
-    --output wdl/05.chunk_2001_2500.tsv
+    --output manifest.tsv
 
 # Per-trait sample sizes from a mapping file
 python3 scripts/generate_manifest.py \
     --sumstats-dir gs://bucket/path/to/sumstats \
     --sample-size-map sample_sizes.tsv \
     --analysis-type pqtl \
-    --output wdl/05.chunk_2001_2500.tsv
+    --output manifest.tsv
 ```
 
 The mapping file (`--sample-size-map`) is a headerless TSV with columns
@@ -91,7 +92,7 @@ production values:
 | `--docker` | `…/mac-filter-rsidify:v1` | Docker image URI |
 | `--mac-threshold` | `30` | Minimum Minor Allele Count |
 | `--maf-threshold` | `0.0001` | Minimum Minor Allele Frequency |
-| `--batch-size` | `10` | Files processed per VM |
+| `--batch-size` | `1` | Files processed per VM (default maximises parallelism) |
 | `--chrom-col` | `#chrom` | Chromosome column name |
 | `--pos-col` | `pos` | Position column name |
 | `--ref-col` | `ref` | Reference allele column name |
@@ -102,6 +103,11 @@ production values:
 
 Use `--no-upload` or `--no-json` to suppress the corresponding side-effect
 (e.g. for dry-runs or regenerating one artefact independently).
+| Key | Description |
+|-----|-------------|
+| `sumstats_manifest` | GCS path to your manifest TSV |
+| `dbsnp_database` | GCS path to the dbSNP SQLite DB |
+| `docker` | Full Docker image URI with tag |
 
 ### 2. Submit to Refinery via `cromwell_interact.py`
 
@@ -119,9 +125,7 @@ cromwell meta <workflow-id> -s          # full scatter summary
 ```
 
 Where `cromwell` is an alias for
-`/path/to/CromwellInteract/cromwell_interact.py` (see your `~/.bash_profile`).
-An SSH SOCKS tunnel must be open beforehand (`cromwell-fg-refinery2` or
-`cromwell-fg-3` alias).
+`/path/to/CromwellInteract/cromwell_interact.py`.
 
 ## WDL Inputs Reference
 
@@ -139,7 +143,7 @@ An SSH SOCKS tunnel must be open beforehand (`cromwell-fg-refinery2` or
 |-------|------|---------|-------------|
 | `mac_threshold` | `Int` | `30` | Minimum Minor Allele Count |
 | `maf_threshold` | `Float` | `0.0001` | Minimum Minor Allele Frequency |
-| `batch_size` | `Int` | `10` | Files processed per VM |
+| `batch_size` | `Int` | `1` | Files processed per VM (default maximises parallelism) |
 | `chrom_col` | `String` | `#chrom` | Chromosome column name in input |
 | `pos_col` | `String` | `pos` | Position column name |
 | `ref_col` | `String` | `ref` | Reference allele column name |
@@ -248,15 +252,16 @@ python3 /path/to/CromwellInteract/cromwell_interact.py outfiles <workflow-uuid>
                                 │
                      ┌──────────▼──────────┐
                      │   create_batches     │
-                     │  (split into N/10    │
-                     │   batch manifests)   │
+                     │  (split into ⌈N/B⌉  │
+                     │   manifests, B =     │
+                     │   batch_size)        │
                      └──────────┬──────────┘
                                 │
               ┌─────────────────┼─────────────────┐
               │                 │                  │
      ┌────────▼────────┐ ┌─────▼──────┐  ┌───────▼───────┐
-     │ batch_0 (10 files│ │ batch_1    │  │ batch_N/10    │
-     │                  │ │ (10 files) │  │ (≤10 files)   │
+     │ batch_0 (≤B     │ │ batch_1    │  │ batch_⌈N/B⌉-1 │
+     │  files)         │ │ (≤B files) │  │ (≤B files)    │
      │ 1. rsIDify       │ │            │  │               │
      │ 2. MAC/MAF filter│ │   ...      │  │    ...        │
      │ 3. LDSC premunge │ │            │  │               │
@@ -274,15 +279,17 @@ python3 /path/to/CromwellInteract/cromwell_interact.py outfiles <workflow-uuid>
 Each scattered batch VM:
 1. **Localises** the ~98 GB dbSNP database once (Cromwell handles this;
    ~3–5 min within europe-west1 at 3–5 Gbps intra-region bandwidth)
-2. **Processes** each of its 10 files sequentially (rsIDify → filter → premunge)
+2. **Processes** each of its files sequentially, up to `batch_size` per shard
+   (rsIDify → filter → premunge)
 3. **Cleans up** temp files after each file to minimise disk usage
 
 ### Why batching?
 
-With hundreds of input files, a naive one-file-per-VM scatter would create
-hundreds of VMs each downloading the 98 GB database.  Batching into groups of
-10 reduces the number of database downloads by 10×, saving ~3–5 min of startup
-overhead per eliminated VM while keeping parallelism high.
+With hundreds of input files, **`batch_size = 1`** (the default) gives the
+maximum number of Cromwell scatter shards: each shard downloads the database
+once for a single sumstats file. If you **raise** `batch_size`, fewer VMs run in
+parallel but each download of the ~98 GB database is shared across more files,
+reducing total download time when you are not limited by Cromwell concurrency.
 
 ### Runtime characteristics per batch VM
 
