@@ -26,8 +26,9 @@ mac-filter-rsidify/
 ├── docker/
 │   └── Dockerfile              # Python 3.11-slim + gawk + bc + gzip
 ├── scripts/
-│   ├── rsidify_sqlite.py       # rsID annotation via SQLite
-│   └── generate_manifest.py    # Helper to create the input manifest
+│   ├── rsidify_sqlite.py           # rsID annotation via SQLite
+│   ├── generate_manifest.py        # Helper to create the input manifest
+│   └── harvest_cromwell_outputs.py # Copy finished Cromwell outputs into chunk folders on GCS
 ├── wdl/
 │   ├── mac_filter_rsidify.wdl  # Main workflow
 │   └── mac_filter_rsidify.json # Example Refinery inputs
@@ -241,6 +242,172 @@ gsutil ls -r "gs://cromwell-fg-3/mac_filter_rsidify/<workflow-uuid>/call-rsidify
 # (requires an SSH tunnel and cromwell_interact.py, or the Cromwell REST API)
 python3 /path/to/CromwellInteract/cromwell_interact.py outfiles <workflow-uuid>
 ```
+
+## Harvesting outputs after Cromwell finishes (standalone)
+
+When a workflow has **already succeeded**, Cromwell keeps `*_intermediary.gz`,
+`*_premunged.gz`, and per-trait `.log` files under the **execution** bucket (for
+example `gs://cromwell-fg-3/mac_filter_rsidify/<workflow-uuid>/`). They are **not**
+copied automatically to `gs://r13-data/fg3_aggregate_pQTLs/...`. Use
+`scripts/harvest_cromwell_outputs.py` to flatten them into a chunk layout you
+control.
+
+### Task this script performs
+
+Given a **workflow id** (and optionally the **workflow root** on GCS), the
+script copies:
+
+| Cromwell / WDL output | Destination under ``--dest`` |
+|------------------------|------------------------------|
+| ``intermediary_outputs`` (full-column MAC/MAF-filtered ``*_intermediary.gz``) | ``<dest>/intermediary/`` |
+| ``per_file_logs`` (pipeline logs, not Cromwell VM logs) | ``<dest>/logs/`` |
+| ``premunged_outputs`` (LDSC five-column ``*_premunged.gz``) | ``<dest>/mac_filtered_output/`` |
+
+Optional ``--copy-summary`` also copies ``summary.csv`` to ``<dest>/logs/summary.csv``.
+
+### Why not only ``gsutil ls -r``?
+
+Under ``call-rsidify_and_filter_batch/``, paths may include **multiple**
+``attempt-*`` directories after retries, and Cromwell may also expose outputs
+under ``shard-N/glob-*`` **without** ``attempt-*`` in the URI. A naive recursive
+copy can duplicate or resurrect stale files. The harvest script resolves the
+correct object per scatter shard (see script docstring). Alternatively, use the
+Cromwell **outputs** API (below), which always lists the final URIs Cromwell
+registered for the workflow.
+
+### Relationship to ``cromwell_interact.py outfiles``
+
+``cromwell_interact.py`` ``outfiles`` calls Cromwell’s
+``GET /api/workflows/v1/{id}/outputs`` over an SSH SOCKS tunnel (same as
+``meta`` / ``submit``). It prints **one ``gs://`` URI per line** for each output
+value, or for a single key if you pass ``-tag``:
+
+```bash
+# After: gcloud compute ssh <cromwell-vm> -- -f -n -N -D localhost:5000
+# Default CromwellInteract ports: SOCKS 5000, remote Cromwell HTTP 80
+
+python3 /path/to/CromwellInteract/cromwell_interact.py outfiles <workflow-uuid> \
+  -tag mac_filter_rsidify.intermediary_outputs
+```
+
+That list is exactly the set of **intermediary** files Cromwell considers
+workflow outputs. The harvest script can consume the **full** JSON payload from
+the same endpoint (see option B), or you can use ``outfiles`` for a quick sanity
+check (line count should match your manifest row count).
+
+Full output keys (for ``-tag``):
+
+* ``mac_filter_rsidify.intermediary_outputs``
+* ``mac_filter_rsidify.premunged_outputs``
+* ``mac_filter_rsidify.per_file_logs``
+* ``mac_filter_rsidify.summary_csv``
+
+### Walk-through
+
+**Prerequisites:** ``gsutil`` on ``PATH``, credentials that can **read** the
+Cromwell execution bucket and **write** ``--dest``. Python 3.9+.
+
+#### Option A — GCS workflow root only (no SSH tunnel) **recommended**
+
+Use this when you know the workflow root on the execution bucket (from Cromwell
+metadata ``workflowRoot``, the UI, or ``cromwell meta <id>``). The script runs
+``gsutil ls -r`` on ``.../call-rsidify_and_filter_batch/`` and selects the
+correct objects per shard.
+
+```bash
+cd /path/to/mac-filter-rsidify
+
+WF_ROOT="gs://cromwell-fg-3/mac_filter_rsidify/<workflow-uuid>"
+DEST="gs://r13-data/fg3_aggregate_pQTLs/02.chunk_0501_1000"
+
+# Inspect counts only
+python3 scripts/harvest_cromwell_outputs.py \
+  --gcs-workflow-root "$WF_ROOT" \
+  --dest "$DEST" \
+  --dry-run
+
+# Copy everything (parallel gsutil cp; tune --workers if needed)
+python3 scripts/harvest_cromwell_outputs.py \
+  --gcs-workflow-root "$WF_ROOT" \
+  --dest "$DEST" \
+  --copy-summary \
+  --workers 32
+```
+
+Resulting layout:
+
+```text
+${DEST}/intermediary/*.gz
+${DEST}/mac_filtered_output/*.gz
+${DEST}/logs/*.log
+${DEST}/logs/summary.csv    # if --copy-summary
+```
+
+#### Option B — Saved Cromwell ``outputs`` JSON (offline copy)
+
+With an SSH tunnel active, save the API response once:
+
+```bash
+curl -sS "http://localhost:80/api/workflows/v1/<workflow-uuid>/outputs" \
+  -H "accept: application/json" \
+  --socks5 localhost:5000 \
+  > outputs.json
+```
+
+Then copy without talking to Cromwell again:
+
+```bash
+python3 scripts/harvest_cromwell_outputs.py \
+  --outputs-json outputs.json \
+  --dest "$DEST" \
+  --copy-summary
+```
+
+The file may be either the full response (with an ``outputs`` key) or the inner
+``outputs`` object only.
+
+#### Option C — Live fetch from Cromwell (tunnel required)
+
+Same curl behaviour as CromwellInteract, invoked from the script:
+
+```bash
+python3 scripts/harvest_cromwell_outputs.py \
+  --workflow-id <workflow-uuid> \
+  --dest "$DEST" \
+  --socks-port 5000 \
+  --http-port 80 \
+  --copy-summary
+```
+
+### Verification
+
+After a run, expect **one object per manifest row** for each of intermediary,
+premunged, and per-trait logs (e.g. 500 for a 500-trait chunk):
+
+```bash
+gsutil ls "${DEST}/intermediary/*.gz" | wc -l
+gsutil ls "${DEST}/mac_filtered_output/*.gz" | wc -l
+gsutil ls "${DEST}/logs/*.log" | wc -l   # excludes summary.csv
+head -5 <(gsutil cat "${DEST}/logs/summary.csv")
+```
+
+If counts are higher than expected, the prefix may already have leftover objects
+from an earlier test; compare basenames to your manifest or re-run into a clean
+prefix.
+
+### Flags reference
+
+| Flag | Purpose |
+|------|---------|
+| ``--gcs-workflow-root`` | Workflow root URI (``gs://.../<uuid>``); scan GCS, no tunnel |
+| ``--outputs-json`` | Saved ``/outputs`` JSON |
+| ``--workflow-id`` | Fetch ``/outputs`` via curl + SOCKS |
+| ``--dest`` | Base ``gs://`` URI for the chunk folder (required) |
+| ``--intermediary-subdir`` / ``--logs-subdir`` / ``--mac-filtered-subdir`` | Override subdirectory names (defaults: ``intermediary``, ``logs``, ``mac_filtered_output``) |
+| ``--workers`` | Parallel ``gsutil cp`` jobs (default: 32) |
+| ``--dry-run`` | Print planned counts only |
+| ``--copy-summary`` | Copy ``summary.csv`` into ``logs/`` |
+| ``--socks-port`` / ``--http-port`` | CromwellInteract-compatible defaults (5000 / 80) |
 
 ## Architecture
 
